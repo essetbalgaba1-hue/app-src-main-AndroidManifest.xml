@@ -81,13 +81,11 @@ class MainActivity : AppCompatActivity() {
                 val searchUrl = "https://www.olx.kz/list/q-$encodedQuery/?page=$currentPage"
                 updateStatus("Стр. $currentPage: загрузка списка...")
                 webView.loadUrl(searchUrl)
-                delay(6000)
+                delay(5500)
 
-                // Прокручиваем список объявлений вниз
-                simulateSwipeDownPage()
+                // Прокручиваем список объявлений, чтобы собрались все анкеты со страницы
                 evalJs("window.scrollTo({top: document.body.scrollHeight / 2, behavior: 'smooth'});")
                 delay(1500)
-                simulateSwipeDownPage()
                 evalJs("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
                 delay(2000)
 
@@ -111,22 +109,18 @@ class MainActivity : AppCompatActivity() {
 
                     if (isAlreadyContacted(adUrl)) {
                         updateStatus("Пропуск повтора (${index + 1}/${links.size})")
-                        delay(400)
+                        delay(300)
                         continue
                     }
 
                     updateStatus("Анкета ${index + 1}/${links.size}: открываем...")
                     webView.loadUrl(adUrl)
-                    delay(5000)
+                    delay(4500)
 
-                    // Имитируем прокрутку пальцем вниз по анкете, чтобы появились кнопки "Сообщение" и "Позвонить"
-                    updateStatus("Анкета ${index + 1}/${links.size}: прокрутка вниз...")
-                    for (step in 1..3) {
-                        if (!isRunning) break
-                        simulateSwipeDownPage()
-                        evalJs("window.scrollBy({top: 450, behavior: 'smooth'});")
-                        delay(1200)
-                    }
+                    // Спускаемся вниз только ОДИН раз и совсем чуть-чуть, чтобы появилась панель с кнопкой "Сообщение"
+                    simulateSmallSwipeDown()
+                    evalJs("window.scrollBy({top: 250, behavior: 'smooth'});")
+                    delay(1200)
 
                     val sellerId = evalJs("""
                         (function() {
@@ -138,48 +132,32 @@ class MainActivity : AppCompatActivity() {
                     if (sellerId.isNotEmpty() && isAlreadyContacted("SELLER_$sellerId")) {
                         updateStatus("Пропуск: '$sellerId' уже писали.")
                         markAsContacted(adUrl)
-                        delay(800)
+                        delay(600)
                         continue
                     }
 
-                    // Ищем кнопку "Сообщение" / "Написать", прокручиваем к ней и нажимаем
-                    var clickedMsgBtn = false
-                    for (attempt in 1..3) {
-                        val clickRes = evalJs("""
-                            (function() {
-                                const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
-                                const msgBtn = btns.find(b => {
-                                    const txt = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
-                                    const testId = (b.getAttribute('data-testid') || b.getAttribute('data-cy') || '').toLowerCase();
-                                    return txt.includes('сообщение') || 
-                                           txt.includes('написать') || 
-                                           testId.includes('chat') || 
-                                           testId.includes('message');
-                                });
-                                if (msgBtn) {
-                                    msgBtn.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                    msgBtn.click();
-                                    return "CLICKED";
-                                }
-                                return "NOT_FOUND";
-                            })();
-                        """.trimIndent())
+                    // Нажимаем на кнопку "Сообщение" / "Написать"
+                    val clickRes = evalJs("""
+                        (function() {
+                            const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                            const msgBtn = btns.find(b => {
+                                const txt = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
+                                const testId = (b.getAttribute('data-testid') || b.getAttribute('data-cy') || '').toLowerCase();
+                                return txt.includes('сообщение') || 
+                                       txt.includes('написать') || 
+                                       testId.includes('chat') || 
+                                       testId.includes('message');
+                            });
+                            if (msgBtn) {
+                                msgBtn.click();
+                                return "CLICKED";
+                            }
+                            return "NOT_FOUND";
+                        })();
+                    """.trimIndent())
 
-                        if (clickRes.contains("CLICKED")) {
-                            clickedMsgBtn = true
-                            break
-                        }
-                        // Если кнопка еще не появилась — толкаем страницу ещё ниже
-                        simulateSwipeDownPage()
-                        evalJs("window.scrollBy({top: 500, behavior: 'smooth'});")
-                        delay(1500)
-                    }
-
-                    delay(3500)
-
-                    // Если после клика поле ввода открылось ниже, слегка прокручиваем к нему
-                    simulateSwipeDownPage()
-                    delay(1000)
+                    val clickedMsgBtn = clickRes.contains("CLICKED")
+                    delay(3000)
 
                     val safeMsg = message.replace("\"", "\\\"").replace("\n", "\\n")
                     val sendResult = evalJs("""
@@ -187,7 +165,6 @@ class MainActivity : AppCompatActivity() {
                             const textarea = document.querySelector('textarea[name="message"], textarea, input[type="text"][placeholder*="сообщ" i]');
                             if (!textarea) return "NO_CHAT";
 
-                            textarea.scrollIntoView({behavior: 'smooth', block: 'center'});
                             textarea.focus();
 
                             const proto = textarea.tagName.toLowerCase() === 'textarea' 
@@ -215,16 +192,17 @@ class MainActivity : AppCompatActivity() {
                         markAsContacted(adUrl)
                         if (sellerId.isNotEmpty()) markAsContacted("SELLER_$sellerId")
 
-                        val waitSec = Random.nextInt(15, 29)
+                        // Пауза от 5 до 10 секунд
+                        val waitSec = Random.nextInt(5, 11)
                         for (sec in waitSec downTo 1) {
                             if (!isRunning) break
                             updateStatus("Отправлено! Пауза: $sec сек...")
                             delay(1000)
                         }
                     } else {
-                        updateStatus(if (clickedMsgBtn) "Не удалось отправить, идём дальше..." else "Сообщения закрыты, идём дальше...")
+                        updateStatus(if (clickedMsgBtn) "Не удалось отправить, дальше..." else "Сообщения закрыты, дальше...")
                         markAsContacted(adUrl)
-                        delay(2000)
+                        delay(1500)
                     }
                 }
                 currentPage++
@@ -232,20 +210,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Имитация реального свайпа пальцем снизу вверх (толкает страницу вниз)
-    private suspend fun simulateSwipeDownPage() {
+    // Один легкий короткий свайп вниз (чтобы активировалась нижняя панель с кнопками)
+    private suspend fun simulateSmallSwipeDown() {
         val downTime = SystemClock.uptimeMillis()
         val x = if (webView.width > 0) webView.width / 2f else 500f
-        val startY = if (webView.height > 0) webView.height * 0.75f else 1200f
-        val endY = if (webView.height > 0) webView.height * 0.25f else 400f
+        val startY = if (webView.height > 0) webView.height * 0.65f else 900f
+        val endY = if (webView.height > 0) webView.height * 0.45f else 650f
 
         val downEvent = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, startY, 0)
         webView.dispatchTouchEvent(downEvent)
         downEvent.recycle()
 
-        val steps = 8
+        val steps = 5
         for (i in 1..steps) {
-            delay(20)
+            delay(15)
             val now = SystemClock.uptimeMillis()
             val currentY = startY - ((startY - endY) * i / steps)
             val moveEvent = MotionEvent.obtain(downTime, now, MotionEvent.ACTION_MOVE, x, currentY, 0)
@@ -253,7 +231,7 @@ class MainActivity : AppCompatActivity() {
             moveEvent.recycle()
         }
 
-        delay(20)
+        delay(15)
         val upTime = SystemClock.uptimeMillis()
         val upEvent = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, x, endY, 0)
         webView.dispatchTouchEvent(upEvent)
