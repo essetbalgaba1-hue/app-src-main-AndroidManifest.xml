@@ -3,6 +3,7 @@ package com.example.olxautosender
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.webkit.CookieManager
@@ -30,6 +31,7 @@ class MainActivity : AppCompatActivity() {
     private var isRunning = false
     private var botJob: Job? = null
     private val mainScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var wakeLock: PowerManager.WakeLock? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,6 +62,27 @@ class MainActivity : AppCompatActivity() {
         btnStop.setOnClickListener { stopBot() }
     }
 
+    private fun acquireWakeLock() {
+        if (wakeLock == null) {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "OlxAutoSender::WakelockTag"
+            )
+        }
+        if (wakeLock?.isHeld == false) {
+            wakeLock?.acquire(10 * 60 * 60 * 1000L) // до 10 часов непрерывной работы в фоне
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {}
+    }
+
     private fun startBot() {
         val query = etSearchQuery.text.toString().trim()
         val message = etMessageText.text.toString().trim()
@@ -72,10 +95,13 @@ class MainActivity : AppCompatActivity() {
         isRunning = true
         btnStart.isEnabled = false
         btnStop.isEnabled = true
+        acquireWakeLock()
 
         botJob = mainScope.launch {
             var currentPage = 1
             val encodedQuery = URLEncoder.encode(query, "UTF-8")
+            // Разбиваем поисковый запрос на ключевые слова для фильтрации (например: "бухгалтер", "удаленно" и т.д.)
+            val queryKeywords = query.lowercase().split(" ").filter { it.length > 2 }
 
             while (isRunning) {
                 val searchUrl = "https://www.olx.kz/list/q-$encodedQuery/?page=$currentPage"
@@ -83,7 +109,6 @@ class MainActivity : AppCompatActivity() {
                 webView.loadUrl(searchUrl)
                 delay(5500)
 
-                // Прокручиваем список объявлений, чтобы собрались все анкеты со страницы
                 evalJs("window.scrollTo({top: document.body.scrollHeight / 2, behavior: 'smooth'});")
                 delay(1500)
                 evalJs("window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});")
@@ -108,16 +133,33 @@ class MainActivity : AppCompatActivity() {
                     if (!isRunning) break
 
                     if (isAlreadyContacted(adUrl)) {
-                        updateStatus("Пропуск повтора (${index + 1}/${links.size})")
-                        delay(300)
+                        updateStatus("Пропуск дубликата (${index + 1}/${links.size})")
+                        delay(200)
                         continue
                     }
 
-                    updateStatus("Анкета ${index + 1}/${links.size}: открываем...")
+                    updateStatus("Анкета ${index + 1}/${links.size}: проверка...")
                     webView.loadUrl(adUrl)
                     delay(4500)
 
-                    // Спускаемся вниз только ОДИН раз и совсем чуть-чуть, чтобы появилась панель с кнопкой "Сообщение"
+                    // СТРОГАЯ ФИЛЬТРАЦИЯ ПО ТЕМАТИКЕ: проверяем заголовок или текст объявления на соответствие запросу
+                    val adTitle = evalJs("""
+                        (function() {
+                            const h1 = document.querySelector('h1');
+                            return h1 ? h1.innerText.toLowerCase() : "";
+                        })();
+                    """.trimIndent()).replace("\"", "")
+
+                    if (queryKeywords.isNotEmpty() && adTitle.isNotEmpty()) {
+                        val matches = queryKeywords.any { adTitle.contains(it) }
+                        if (!matches) {
+                            updateStatus("Пропуск (не по теме запроса): '$adTitle'")
+                            markAsContacted(adUrl) // запоминаем, чтобы не проверять повторно
+                            delay(400)
+                            continue
+                        }
+                    }
+
                     simulateSmallSwipeDown()
                     evalJs("window.scrollBy({top: 250, behavior: 'smooth'});")
                     delay(1200)
@@ -130,13 +172,13 @@ class MainActivity : AppCompatActivity() {
                     """.trimIndent()).replace("\"", "")
 
                     if (sellerId.isNotEmpty() && isAlreadyContacted("SELLER_$sellerId")) {
-                        updateStatus("Пропуск: '$sellerId' уже писали.")
+                        updateStatus("Пропуск: компании '$sellerId' уже писали.")
                         markAsContacted(adUrl)
-                        delay(600)
+                        delay(500)
                         continue
                     }
 
-                    // Нажимаем на кнопку "Сообщение" / "Написать"
+                    // Нажимаем кнопку "Сообщение"
                     val clickRes = evalJs("""
                         (function() {
                             const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -157,7 +199,28 @@ class MainActivity : AppCompatActivity() {
                     """.trimIndent())
 
                     val clickedMsgBtn = clickRes.contains("CLICKED")
-                    delay(3000)
+                    delay(3500) // Ждем загрузки чата
+
+                    // ПРОВЕРКА ИСТОРИИ ЧАТА: если там уже есть сообщения или диалог не пустой — пропускаем!
+                    val isChatAlreadyUsed = evalJs("""
+                        (function() {
+                            const chatContainer = document.querySelector('[data-testid="chat-messages"], .css-1owrcbn, div[class*="message"]');
+                            const messages = document.querySelectorAll('div[class*="message"], p[class*="text"]');
+                            // Если поле ввода уже содержит текст или в чате есть предыдущие сообщения
+                            const textarea = document.querySelector('textarea[name="message"], textarea');
+                            if (textarea && textarea.value.trim().length > 0) return "YES";
+                            if (messages.length > 3) return "YES"; // Если есть старая переписка
+                            return "NO";
+                        })();
+                    """.trimIndent())
+
+                    if (isChatAlreadyUsed.contains("YES")) {
+                        updateStatus("Пропуск: диалог с этим клиентом уже ведется!")
+                        markAsContacted(adUrl)
+                        if (sellerId.isNotEmpty()) markAsContacted("SELLER_$sellerId")
+                        delay(1000)
+                        continue
+                    }
 
                     val safeMsg = message.replace("\"", "\\\"").replace("\n", "\\n")
                     val sendResult = evalJs("""
@@ -192,7 +255,7 @@ class MainActivity : AppCompatActivity() {
                         markAsContacted(adUrl)
                         if (sellerId.isNotEmpty()) markAsContacted("SELLER_$sellerId")
 
-                        // Пауза от 5 до 10 секунд
+                        // Рандомная пауза от 5 до 10 секунд
                         val waitSec = Random.nextInt(5, 11)
                         for (sec in waitSec downTo 1) {
                             if (!isRunning) break
@@ -210,7 +273,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Один легкий короткий свайп вниз (чтобы активировалась нижняя панель с кнопками)
     private suspend fun simulateSmallSwipeDown() {
         val downTime = SystemClock.uptimeMillis()
         val x = if (webView.width > 0) webView.width / 2f else 500f
@@ -241,6 +303,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopBot() {
         isRunning = false
         botJob?.cancel()
+        releaseWakeLock()
         btnStart.isEnabled = true
         btnStop.isEnabled = false
         updateStatus("Статус: Остановлено")
@@ -283,6 +346,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseWakeLock()
         mainScope.cancel()
     }
 }
